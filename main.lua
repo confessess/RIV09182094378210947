@@ -5312,15 +5312,24 @@ local function instanceWrapAirflowWindow(window)
     return proxy
 end
 
-local function instanceWrapAirflowLibrary(customLibrary)
-    local airflow = instanceLoadAirflowLibrary()
+local function instanceWrapAirflowLibrary(customLibrary, airflow)
+    airflow = airflow or instanceLoadAirflowLibrary()
+    if not customLibrary then
+        customLibrary = loadInstanceLibrary()
+    end
     if not airflow or not (airflow.Window or airflow.CreateWindow) then
         return customLibrary
     end
 
     local adapter = setmetatable({}, {
         __index = function(_, key)
-            return customLibrary[key]
+            if customLibrary and customLibrary[key] ~= nil then
+                return customLibrary[key]
+            end
+            if airflow and airflow[key] ~= nil then
+                return airflow[key]
+            end
+            return nil
         end,
     })
 
@@ -5357,10 +5366,12 @@ local function instanceWrapAirflowLibrary(customLibrary)
     return adapter
 end
 
-local Library = instanceLoadAirflowLibrary() or loadInstanceLibrary()
-if Library and Library.Window and not Library.CreateWindow then
+local CustomLibrary = loadInstanceLibrary()
+local AirflowLibrary = instanceLoadAirflowLibrary()
+local Library = instanceWrapAirflowLibrary(CustomLibrary, AirflowLibrary)
+if Library and Library._airflow and Library._airflow.Window and not Library.CreateWindow then
     Library.CreateWindow = function(_, config)
-        return Library.Window(config)
+        return Library._airflow.Window(config)
     end
 end
 
