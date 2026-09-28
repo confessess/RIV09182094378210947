@@ -4686,979 +4686,785 @@ return Library]==]
     error("[instance] library failed to load")
 end
 
-local function instanceLoadAirflowLibrary()
-    local cacheKey = "Instance_Airflow_Library"
+-- ============================================================================
+-- Airflow UI backend adapter
+--
+-- Replaces the custom blue menu library with the real AirFlow UI library
+-- (confessess/AIRFLOW0978109571095710975) as the actual on-screen menu,
+-- while every existing AddToggle/AddSlider/AddDropdown/... call site further
+-- down in this script keeps working completely unchanged (same Idx keys,
+-- same Info field names, same returned-object method names, same global
+-- `Options`/`Toggles` tables). Only this block + the single line assigning
+-- `Library` below it were changed to switch the UI backend.
+-- ============================================================================
+
+local Toggles, Options = {}, {}
+getgenv().Toggles = Toggles
+getgenv().Options = Options
+
+local InstanceUserInputService = game:GetService("UserInputService")
+
+local function instanceLoadAirflow()
+    local cacheKey = "Instance_AirFlow_Real"
     if getgenv()[cacheKey] then
         return getgenv()[cacheKey]
     end
 
     local ok, lib = pcall(function()
         local src = game:HttpGet("https://raw.githubusercontent.com/confessess/AIRFLOW0978109571095710975/main/source.lua")
-        local loader = loadstring or load
-        local mod = loader(src)
-        if type(mod) ~= "function" then
-            return nil
-        end
-        return mod()
+        local compiler = loadstring or load
+        return compiler(src)()
     end)
 
-    if ok and lib and (lib.Window or lib.CreateWindow) then
-        getgenv()[cacheKey] = lib
-        return lib
+    if not ok or type(lib) ~= "table" or type(lib.Window) ~= "function" then
+        error("[instance] Airflow UI failed to load: " .. tostring(lib))
     end
 
-    return nil
+    getgenv()[cacheKey] = lib
+    return lib
 end
 
-local function instanceWrapControl(control, kind, section, idx)
-    local proxy = {
-        Value = (control and control.Value ~= nil) and control.Value or nil,
-        Type = kind,
-        _control = control,
-        _section = section,
-        _idx = idx,
-        _callbacks = {},
-    }
+local function instanceDarkenColor(Color, Factor)
+    Factor = Factor or 0.7
+    return Color3.new(Color.R * Factor, Color.G * Factor, Color.B * Factor)
+end
 
-    local function sync()
-        if control and type(control.Get) == "function" then
-            local value = control:Get()
-            if value ~= nil then
-                proxy.Value = value
-            end
-            return proxy.Value
+local function instanceSafeCall(fn, ...)
+    if type(fn) ~= "function" then return end
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        warn("[instance] callback error: " .. tostring(err))
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Addon controls (ColorPicker / KeyPicker) chained onto a Toggle/Slider/etc.
+-- Both return the *parent* control (matching the original chaining contract),
+-- not the addon itself.
+-- ---------------------------------------------------------------------------
+
+local function instanceAddColorPickerAddon(airflowTab, parent, Idx, Info)
+    Info = Info or {}
+    local proxy = { Type = "ColorPicker", _listeners = {}, Transparency = Info.Transparency or 0 }
+
+    local native = airflowTab:ColorPicker({
+        Name = Info.Title or Info.Text or "Color",
+        Desc = Info.Tooltip,
+        Default = Info.Default or Color3.fromRGB(255, 255, 255),
+        Flag = Idx,
+        Callback = function(value)
+            proxy.Value = value
+            instanceSafeCall(Info.Callback, value, proxy.Transparency)
+            for _, fn in ipairs(proxy._listeners) do instanceSafeCall(fn, value, proxy.Transparency) end
+        end,
+    })
+
+    proxy._native = native
+    proxy.Value = native.Value
+
+    function proxy:SetValue(hsv, transparency)
+        if type(hsv) == "table" then
+            native:Set(Color3.fromHSV(hsv[1], hsv[2], hsv[3]))
         end
-        if control and control.Value ~= nil then
-            proxy.Value = control.Value
-        end
-        return proxy.Value
+        proxy.Transparency = transparency or proxy.Transparency
+        return proxy
     end
 
-    function proxy:Display()
-        if control and type(control.Refresh) == "function" then
-            control:Refresh()
-        end
-        if control and type(control.Update) == "function" then
-            control:Update()
-        end
-        sync()
-        return self
+    function proxy:SetValueRGB(color, transparency)
+        if color then native:Set(color) end
+        proxy.Transparency = transparency or proxy.Transparency
+        return proxy
     end
-    proxy.Update = proxy.Display
 
     function proxy:OnChanged(fn)
-        if type(fn) ~= "function" then
-            return self
+        if type(fn) == "function" then
+            table.insert(proxy._listeners, fn)
+            fn(proxy.Value, proxy.Transparency)
         end
-        table.insert(proxy._callbacks, fn)
-        if control and type(control.OnChanged) == "function" then
-            control:OnChanged(function(value)
-                proxy.Value = value
-                for _, cb in ipairs(proxy._callbacks) do
-                    pcall(cb, value)
-                end
-            end)
-        end
-        return self
+        return proxy
     end
+
+    Options[Idx] = proxy
+    parent.Addons = parent.Addons or {}
+    table.insert(parent.Addons, proxy)
+    return parent
+end
+
+local function instanceAddKeyPickerAddon(airflowTab, parent, Idx, Info)
+    Info = Info or {}
+    local proxy = {
+        Type = "KeyPicker",
+        _listeners = {},
+        Mode = Info.Mode or "Toggle",
+        Toggled = false,
+        SyncToggleState = Info.SyncToggleState or false,
+    }
+
+    local defaultKey = Info.Default
+    if type(defaultKey) == "string" then
+        defaultKey = defaultKey ~= "None" and Enum.KeyCode[defaultKey] or nil
+    end
+
+    local native = airflowTab:Keybind({
+        Name = Info.Text,
+        Desc = Info.Tooltip,
+        Default = defaultKey,
+        Flag = Idx,
+        Callback = function()
+            if proxy.Mode == "Toggle" then
+                proxy.Toggled = not proxy.Toggled
+            end
+            if proxy.SyncToggleState and parent.SetValue then
+                parent:SetValue(not parent.Value)
+            end
+            instanceSafeCall(Info.Callback, proxy.Toggled)
+            instanceSafeCall(proxy.Clicked, proxy.Toggled)
+        end,
+        OnChanged = function(keycode)
+            proxy.Value = keycode and keycode.Name or "None"
+            for _, fn in ipairs(proxy._listeners) do instanceSafeCall(fn, proxy.Value) end
+        end,
+    })
+
+    proxy._native = native
+    proxy.Value = (native.Value and native.Value.Name) or "None"
+
+    function proxy:GetState()
+        if proxy.Mode == "Always" then return true end
+        if proxy.Mode == "Hold" then
+            if not native.Value then return false end
+            local ok, held = pcall(function() return InstanceUserInputService:IsKeyDown(native.Value) end)
+            return ok and held or false
+        end
+        return proxy.Toggled
+    end
+
+    function proxy:SetValue(data)
+        local key, mode
+        if type(data) == "table" then
+            key, mode = data[1] or data.key, data[2] or data.mode
+        elseif typeof(data) == "EnumItem" then
+            key, mode = data.Name, proxy.Mode
+        elseif data then
+            key, mode = tostring(data), proxy.Mode
+        end
+        proxy.Mode = mode or proxy.Mode
+        if key and key ~= "None" and Enum.KeyCode[key] then
+            native:Set(Enum.KeyCode[key])
+        end
+        return proxy
+    end
+
+    function proxy:Update() return proxy end
+    function proxy:Display() return proxy end
+    function proxy:OnClick(fn) proxy.Clicked = fn; return proxy end
+
+    function proxy:OnChanged(fn)
+        if type(fn) == "function" then
+            table.insert(proxy._listeners, fn)
+            fn(proxy.Value)
+        end
+        return proxy
+    end
+
+    Options[Idx] = proxy
+    parent.Addons = parent.Addons or {}
+    table.insert(parent.Addons, proxy)
+    return parent
+end
+
+-- ---------------------------------------------------------------------------
+-- Primary controls
+-- ---------------------------------------------------------------------------
+
+local function instanceAddToggle(airflowTab, Idx, Info)
+    Info = Info or {}
+    local proxy = { Type = "Toggle", _listeners = {}, Addons = {} }
+
+    local native = airflowTab:Toggle({
+        Name = Info.Text,
+        Desc = Info.Tooltip,
+        Default = Info.Default or false,
+        Flag = Idx,
+        Callback = function(value)
+            proxy.Value = value
+            instanceSafeCall(Info.Callback, value)
+            instanceSafeCall(proxy.Changed, value)
+            for _, fn in ipairs(proxy._listeners) do instanceSafeCall(fn, value) end
+        end,
+    })
+
+    proxy._native = native
+    proxy.Value = native.Value
 
     function proxy:SetValue(value)
-        if control then
-            if type(control.Set) == "function" then
-                control:Set(value)
-            elseif type(control.SetValue) == "function" then
-                control:SetValue(value)
-            elseif control.Value ~= nil then
-                control.Value = value
-            end
-        end
-        if value ~= nil then
-            proxy.Value = value
-        end
-        sync()
-        for _, cb in ipairs(proxy._callbacks) do
-            pcall(cb, proxy.Value)
-        end
-        return self
+        native:Set(not not value)
+        return proxy
     end
 
-    if kind == "Toggle" then
-        function proxy:Set(value)
-            return proxy:SetValue(value)
+    function proxy:OnChanged(fn)
+        proxy.Changed = fn
+        if type(fn) == "function" then
+            table.insert(proxy._listeners, fn)
+            fn(proxy.Value)
         end
-        function proxy:Get()
-            return sync()
-        end
-        function proxy:AddKeyPicker(keyIdx, info)
-            if section and type(section.AddKeyPicker) == "function" then
-                return section:AddKeyPicker(keyIdx, info)
-            end
-            return self
-        end
-    elseif kind == "Slider" then
-        function proxy:Get()
-            return sync()
-        end
-    elseif kind == "Dropdown" then
-        function proxy:SetValues(values)
-            if control and type(control.SetValues) == "function" then
-                control:SetValues(values)
-            elseif control and type(control.Set) == "function" then
-                control:Set(values)
-            end
-            if values ~= nil then
-                proxy.Value = values
-            end
-            return self
-        end
-        function proxy:Get()
-            return sync()
-        end
-    elseif kind == "Input" then
-        function proxy:Get()
-            return sync()
-        end
-    elseif kind == "ColorPicker" then
-        function proxy:SetValueRGB(color, transparency)
-            if control then
-                if type(control.SetColor) == "function" then
-                    control:SetColor(color, transparency)
-                elseif type(control.SetValueRGB) == "function" then
-                    control:SetValueRGB(color, transparency)
-                elseif type(control.SetValue) == "function" then
-                    control:SetValue(color, transparency)
-                else
-                    control.Value = color
-                    if control.Transparency ~= nil then
-                        control.Transparency = transparency or 0
-                    end
-                end
-            end
-            if color ~= nil then
-                proxy.Value = color
-            end
-            return self
-        end
-    elseif kind == "KeyPicker" then
-        function proxy:Update()
-            if control and type(control.Update) == "function" then
-                control:Update()
-            end
-            return self
-        end
-        function proxy:Display()
-            if control and type(control.Display) == "function" then
-                control:Display()
-            end
-            return self
-        end
-        function proxy:SetValue(entry)
-            if control then
-                if type(control.SetValue) == "function" then
-                    control:SetValue(entry)
-                elseif type(control.Set) == "function" then
-                    control:Set(entry)
-                end
-            end
-            if type(entry) == "table" then
-                proxy.Value = entry[1] or proxy.Value
-                proxy.Mode = entry[2] or proxy.Mode
-            end
-            return self
-        end
+        return proxy
     end
 
+    function proxy:Display() return proxy end
+    proxy.UpdateColors = proxy.Display
+
+    function proxy:AddKeyPicker(KeyIdx, KeyInfo)
+        return instanceAddKeyPickerAddon(airflowTab, proxy, KeyIdx, KeyInfo)
+    end
+
+    function proxy:AddColorPicker(ColorIdx, ColorInfo)
+        return instanceAddColorPickerAddon(airflowTab, proxy, ColorIdx, ColorInfo)
+    end
+
+    Toggles[Idx] = proxy
     return proxy
 end
 
-local function instanceWrapAirflowSection(section, ownerTab)
-    local group = {
-        _section = section,
-        _ownerTab = ownerTab,
-        Groupboxes = {},
-        Tabboxes = {},
-        Container = section and (section.List or section.Frame or section) or nil,
+local function instanceAddSlider(airflowTab, Idx, Info)
+    Info = Info or {}
+    local rounding = Info.Rounding or 0
+    local step = rounding > 0 and (1 / (10 ^ rounding)) or 1
+
+    local proxy = { Type = "Slider", _listeners = {}, Min = Info.Min, Max = Info.Max, Rounding = rounding }
+
+    local native = airflowTab:Slider({
+        Name = Info.Text,
+        Desc = Info.Tooltip,
+        Min = Info.Min or 0,
+        Max = Info.Max or 100,
+        Step = step,
+        Suffix = Info.Suffix or "",
+        Default = Info.Default,
+        Flag = Idx,
+        Callback = function(value)
+            proxy.Value = value
+            instanceSafeCall(Info.Callback, value)
+            instanceSafeCall(proxy.Changed, value)
+            for _, fn in ipairs(proxy._listeners) do instanceSafeCall(fn, value) end
+        end,
+    })
+
+    proxy._native = native
+    proxy.Value = native.Value
+
+    function proxy:SetValue(value)
+        local num = tonumber(value)
+        if num then native:Set(math.clamp(num, proxy.Min or num, proxy.Max or num)) end
+        return proxy
+    end
+
+    function proxy:OnChanged(fn)
+        proxy.Changed = fn
+        if type(fn) == "function" then
+            table.insert(proxy._listeners, fn)
+            fn(proxy.Value)
+        end
+        return proxy
+    end
+
+    function proxy:Display() return proxy end
+    proxy.UpdateColors = proxy.Display
+
+    Options[Idx] = proxy
+    return proxy
+end
+
+local function instanceAddMultiSlider(airflowTab, Idx, Info)
+    Info = Info or {}
+    local default = Info.Default or {}
+    local proxy = {
+        Type = "MultiSlider",
+        _listeners = {},
+        Min = Info.Min,
+        Max = Info.Max,
+        Rounding = Info.Rounding or 0,
+        MinValue = default.Min or Info.Min,
+        MaxValue = default.Max or Info.Max,
     }
 
-    local function mapInfo(info, fallbackText)
-        local text = info and (info.Text or info.Title or info.Name or fallbackText or "Option") or (fallbackText or "Option")
-        local desc = info and (info.Tooltip or info.Desc or info.Description) or nil
-        return text, desc
+    local function fireChanged()
+        local payload = { Min = proxy.MinValue, Max = proxy.MaxValue }
+        instanceSafeCall(Info.Callback, payload)
+        instanceSafeCall(proxy.Changed, payload)
+        for _, fn in ipairs(proxy._listeners) do instanceSafeCall(fn, payload) end
     end
 
-    local function registerControl(kind, idx, obj)
-        if idx and type(idx) == "string" then
-            local env = getgenv()
-            env.Options = env.Options or {}
-            env.Options[idx] = obj
-            if kind == "Toggle" then
-                env.Toggles = env.Toggles or {}
-                env.Toggles[idx] = obj
+    local minNative = airflowTab:Slider({
+        Name = (Info.Text or "Value") .. " (min)",
+        Min = Info.Min or 0, Max = Info.Max or 100,
+        Step = proxy.Rounding > 0 and (1 / (10 ^ proxy.Rounding)) or 1,
+        Suffix = Info.Suffix or "",
+        Default = proxy.MinValue,
+        Flag = Idx and (Idx .. "_Min") or nil,
+        Callback = function(value) proxy.MinValue = value; fireChanged() end,
+    })
+    local maxNative = airflowTab:Slider({
+        Name = (Info.Text or "Value") .. " (max)",
+        Min = Info.Min or 0, Max = Info.Max or 100,
+        Step = proxy.Rounding > 0 and (1 / (10 ^ proxy.Rounding)) or 1,
+        Suffix = Info.Suffix or "",
+        Default = proxy.MaxValue,
+        Flag = Idx and (Idx .. "_Max") or nil,
+        Callback = function(value) proxy.MaxValue = value; fireChanged() end,
+    })
+
+    proxy._native = minNative
+    proxy._nativeMax = maxNative
+
+    function proxy:SetMin(value)
+        local num = tonumber(value)
+        if num then minNative:Set(num) end
+        return proxy
+    end
+
+    function proxy:SetMax(value)
+        local num = tonumber(value)
+        if num then maxNative:Set(num) end
+        return proxy
+    end
+
+    function proxy:OnChanged(fn)
+        proxy.Changed = fn
+        if type(fn) == "function" then
+            table.insert(proxy._listeners, fn)
+            fn({ Min = proxy.MinValue, Max = proxy.MaxValue })
+        end
+        return proxy
+    end
+
+    function proxy:Display() return proxy end
+
+    Options[Idx] = proxy
+    return proxy
+end
+
+local function instanceAddDropdown(airflowTab, Idx, Info)
+    Info = Info or {}
+    local values = Info.Values or {}
+
+    local defaultForAirflow = Info.Default
+    if Info.Multi and type(defaultForAirflow) == "table" then
+        local isArray = defaultForAirflow[1] ~= nil or next(defaultForAirflow) == nil
+        if not isArray then
+            local arr = {}
+            for k, v in pairs(defaultForAirflow) do
+                if v then table.insert(arr, k) end
             end
-            if _G then
-                _G.Options = _G.Options or {}
-                _G.Options[idx] = obj
-                if kind == "Toggle" then
-                    _G.Toggles = _G.Toggles or {}
-                    _G.Toggles[idx] = obj
-                end
+            defaultForAirflow = arr
+        end
+    end
+
+    local proxy = { Type = "Dropdown", _listeners = {}, Values = values, Multi = Info.Multi }
+
+    local native = airflowTab:Dropdown({
+        Name = Info.Text,
+        Desc = Info.Tooltip,
+        Options = values,
+        Multi = Info.Multi or false,
+        Default = defaultForAirflow,
+        Flag = Idx,
+        Callback = function(value)
+            if Info.Multi then
+                local set = {}
+                for _, v in ipairs(value) do set[v] = true end
+                proxy.Value = set
+            else
+                proxy.Value = value
+            end
+            instanceSafeCall(Info.Callback, proxy.Value)
+            instanceSafeCall(proxy.Changed, proxy.Value)
+            for _, fn in ipairs(proxy._listeners) do instanceSafeCall(fn, proxy.Value) end
+        end,
+    })
+
+    proxy._native = native
+    if Info.Multi then
+        local set = {}
+        for _, v in ipairs(native.Value or {}) do set[v] = true end
+        proxy.Value = set
+    else
+        proxy.Value = native.Value
+    end
+
+    function proxy:SetValue(value)
+        if Info.Multi and type(value) == "table" then
+            local isArray = value[1] ~= nil or next(value) == nil
+            if not isArray then
+                local arr = {}
+                for k, v in pairs(value) do if v then table.insert(arr, k) end end
+                value = arr
             end
         end
-        return obj
+        native:Set(value)
+        return proxy
     end
 
-    function group:AddBlank()
-        return self
+    function proxy:SetValues(newValues)
+        proxy.Values = newValues or {}
+        native:Refresh(proxy.Values, true)
+        return proxy
     end
 
-    function group:AddLabel(Text, DoesWrap)
-        if section and type(section.Label) == "function" then
-            local native = section:Label({
-                Name = Text,
-                Title = Text,
-            })
-            local obj = { Value = Text, Type = "Label", _native = native }
-            function obj:SetText(v)
-                self.Value = v
-                if native and type(native.Set) == "function" then
-                    native:Set(v)
-                end
-            end
-            return obj
+    function proxy:OnChanged(fn)
+        proxy.Changed = fn
+        if type(fn) == "function" then
+            table.insert(proxy._listeners, fn)
+            fn(proxy.Value)
         end
-        return { Value = Text, Type = "Label" }
+        return proxy
     end
 
-    function group:AddButton(...)
-        local args = { ... }
-        local text, callback = "Button", function() end
-        if type(args[1]) == "table" then
-            local info = args[1]
-            text = info.Text or info.Title or info.Name or "Button"
-            callback = info.Func or info.Callback or callback
-        else
-            text = args[1] or text
-            callback = args[2] or callback
+    function proxy:Display() return proxy end
+
+    Options[Idx] = proxy
+    return proxy
+end
+
+local function instanceAddInput(airflowTab, Idx, Info)
+    Info = Info or {}
+    local proxy = { Type = "Input", _listeners = {} }
+
+    local native = airflowTab:Input({
+        Name = Info.Text,
+        Desc = Info.Tooltip,
+        PlaceholderText = Info.Placeholder or "",
+        Default = Info.Default or "",
+        Numeric = Info.Numeric,
+        Flag = Idx,
+        Callback = function(text, enterPressed)
+            proxy.Value = text
+            instanceSafeCall(Info.Callback, text, enterPressed)
+            instanceSafeCall(proxy.Changed, text)
+            for _, fn in ipairs(proxy._listeners) do instanceSafeCall(fn, text) end
+        end,
+    })
+
+    proxy._native = native
+    proxy.Value = native.Value
+
+    function proxy:SetValue(value)
+        native:Set(tostring(value))
+        return proxy
+    end
+
+    function proxy:OnChanged(fn)
+        proxy.Changed = fn
+        if type(fn) == "function" then
+            table.insert(proxy._listeners, fn)
+            fn(proxy.Value)
         end
-
-        if section and type(section.Button) == "function" then
-            local native = section:Button({
-                Name = text,
-                Title = text,
-                Callback = function(...)
-                    if type(callback) == "function" then
-                        local ok, err = pcall(callback, ...)
-                        if not ok and warn then
-                            warn("[Instance] button callback error: " .. tostring(err))
-                        end
-                    end
-                end,
-            })
-            local obj = {
-                Value = text,
-                Type = "Button",
-                _native = native,
-                _group = group,
-            }
-            function obj:AddButton(btnText, fn)
-                return group:AddButton(btnText, fn)
-            end
-            function obj:AddTooltip(_)
-                return self
-            end
-            return obj
-        end
-        return { Value = text, Type = "Button" }
+        return proxy
     end
 
-    function group:AddDivider()
-        if section and type(section.Divider) == "function" then
-            section:Divider()
-        end
-        return self
+    function proxy:Display() return proxy end
+
+    Options[Idx] = proxy
+    return proxy
+end
+
+local function instanceAddButton(airflowTab, ...)
+    local args = { ... }
+    local text, callback
+
+    if type(args[1]) == "table" then
+        local info = args[1]
+        text = info.Text or info.Name or "Button"
+        callback = info.Func or info.Callback
+    else
+        text = args[1] or "Button"
+        callback = args[2]
     end
 
-    function group:AddInput(Idx, Info)
-        local info = Info or {}
-        local text, desc = mapInfo(info, Idx)
-        local native = section and section:Input and section:Input({
-            Name = Idx or text,
-            Title = text,
-            Desc = desc,
-            PlaceholderText = info.Placeholder or "",
-            Default = info.Default or "",
-            Value = info.Default or "",
-            Callback = function(v)
-                if info.Callback and type(info.Callback) == "function" then
-                    pcall(info.Callback, v)
-                end
-            end,
-        }) or nil
-        local obj = instanceWrapControl(native, "Input", section, Idx)
-        obj.Value = info.Default or ""
-        return registerControl("Input", Idx, obj)
+    local native = airflowTab:Button({
+        Name = text,
+        Callback = function() instanceSafeCall(callback) end,
+    })
+
+    local proxy = { Type = "Button", _native = native }
+    function proxy:SetText(t) instanceSafeCall(native.SetText, native, t) end
+    return proxy
+end
+
+local function instanceAddLabel(airflowTab, Text, DoesWrap)
+    local native = airflowTab:Label({ Text = Text })
+    local proxy = { Type = "Label", _native = native, Value = Text }
+    function proxy:SetText(t)
+        proxy.Value = t
+        instanceSafeCall(native.Set, native, t)
+    end
+    return proxy
+end
+
+local function instanceAddDivider(airflowTab)
+    pcall(function() airflowTab:Divider() end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Container shim: stands in for Tab / Groupbox / Tabbox-subtab / DependencyBox.
+-- Per-tab sub-tabs (old AddLeftTabbox/AddRightTabbox) and groupboxes are all
+-- merged into the SAME real Airflow tab as Section() headings (Airflow has no
+-- nested tabs or bordered boxes), so every control still ends up reachable in
+-- exactly one place with zero changes needed at any call site.
+-- ---------------------------------------------------------------------------
+
+local instanceMakeContainer
+
+instanceMakeContainer = function(airflowTab, sectionName, trackList)
+    local container = { Container = true, Groupboxes = {}, Tabboxes = {} }
+
+    if sectionName then
+        pcall(function() airflowTab:Section(sectionName) end)
     end
 
-    function group:AddToggle(Idx, Info)
-        local info = Info or {}
-        local text, desc = mapInfo(info, Idx)
-        local native = section and section:Toggle and section:Toggle({
-            Name = Idx or text,
-            Title = text,
-            Desc = desc,
-            Default = info.Default or false,
-            Value = info.Default or false,
-            Callback = function(v)
-                if info.Callback and type(info.Callback) == "function" then
-                    pcall(info.Callback, v)
-                end
-            end,
-        }) or nil
-        local obj = instanceWrapControl(native, "Toggle", section, Idx)
-        obj.Value = info.Default or false
-        return registerControl("Toggle", Idx, obj)
+    local function track(control)
+        if trackList then table.insert(trackList, control) end
+        return control
     end
 
-    function group:AddSlider(Idx, Info)
-        local info = Info or {}
-        local text, desc = mapInfo(info, Idx)
-        local defaultValue = info.Default or info.Min or 0
-        local native = section and section:Slider and section:Slider({
-            Name = Idx or text,
-            Title = text,
-            Desc = desc,
-            Min = info.Min or 0,
-            Max = info.Max or 100,
-            Default = defaultValue,
-            Value = defaultValue,
-            Step = info.Rounding and math.pow(10, -math.max(0, tonumber(info.Rounding) or 0)) or (info.Step or 1),
-            Suffix = info.Suffix or "",
-            Callback = function(v)
-                if info.Callback and type(info.Callback) == "function" then
-                    pcall(info.Callback, v)
-                end
-            end,
-        }) or nil
-        local obj = instanceWrapControl(native, "Slider", section, Idx)
-        obj.Value = defaultValue
-        return registerControl("Slider", Idx, obj)
-    end
-
-    function group:AddDropdown(Idx, Info)
-        local info = Info or {}
-        local text, desc = mapInfo(info, Idx)
-        local current = info.Default
-        if info.Multi then
-            current = info.Default or {}
-        elseif info.AllowNull and current == nil then
-            current = nil
-        end
-        local native = section and section:Dropdown and section:Dropdown({
-            Name = Idx or text,
-            Title = text,
-            Desc = desc,
-            Values = info.Values or {},
-            Default = current,
-            Value = current,
-            Multi = info.Multi,
-            MultipleOptions = info.Multi,
-            Callback = function(v)
-                if info.Callback and type(info.Callback) == "function" then
-                    pcall(info.Callback, v)
-                end
-            end,
-        }) or nil
-        local obj = instanceWrapControl(native, "Dropdown", section, Idx)
-        obj.Value = current
-        return registerControl("Dropdown", Idx, obj)
-    end
-
-    function group:AddColorPicker(Idx, Info)
-        local info = Info or {}
-        local text, desc = mapInfo(info, Idx)
-        local native = section and section:ColorPicker and section:ColorPicker({
-            Name = Idx or text,
-            Title = text,
-            Desc = desc,
-            Default = info.Default or Color3.fromRGB(255, 255, 255),
-            Callback = function(v)
-                if info.Callback and type(info.Callback) == "function" then
-                    pcall(info.Callback, v)
-                end
-            end,
-        }) or nil
-        local obj = instanceWrapControl(native, "ColorPicker", section, Idx)
-        obj.Value = info.Default or Color3.fromRGB(255, 255, 255)
-        return registerControl("ColorPicker", Idx, obj)
-    end
-
-    function group:AddKeyPicker(Idx, Info)
-        local info = Info or {}
-        local text, desc = mapInfo(info, Idx)
-        local native = section and section:Keybind and section:Keybind({
-            Name = Idx or text,
-            Title = text,
-            Desc = desc,
-            Default = info.Default or Enum.KeyCode.None,
-            Value = info.Default or Enum.KeyCode.None,
-            Callback = function(v)
-                if info.Callback and type(info.Callback) == "function" then
-                    pcall(info.Callback, v)
-                end
-            end,
-        }) or nil
-        local obj = instanceWrapControl(native, "KeyPicker", section, Idx)
-        obj.Value = info.Default or Enum.KeyCode.None
-        obj.Mode = info.Mode or "Toggle"
-        return registerControl("KeyPicker", Idx, obj)
-    end
-
-    function group:AddKeybind(Idx, Info)
-        return group:AddKeyPicker(Idx, Info)
-    end
-
-    function group:AddDualSlider(LeftIdx, RightIdx, LeftInfo, RightInfo)
-        local left = group:AddSlider(LeftIdx, LeftInfo)
-        local right = group:AddSlider(RightIdx, RightInfo)
+    function container:AddToggle(Idx, Info) return track(instanceAddToggle(airflowTab, Idx, Info)) end
+    function container:AddSlider(Idx, Info) return track(instanceAddSlider(airflowTab, Idx, Info)) end
+    function container:AddMultiSlider(Idx, Info) return track(instanceAddMultiSlider(airflowTab, Idx, Info)) end
+    function container:AddDualSlider(LeftIdx, RightIdx, LeftInfo, RightInfo)
+        local left = track(instanceAddSlider(airflowTab, LeftIdx, LeftInfo))
+        local right = track(instanceAddSlider(airflowTab, RightIdx, RightInfo))
         return left, right
     end
+    function container:AddDropdown(Idx, Info) return track(instanceAddDropdown(airflowTab, Idx, Info)) end
+    function container:AddInput(Idx, Info) return track(instanceAddInput(airflowTab, Idx, Info)) end
+    function container:AddButton(...) return track(instanceAddButton(airflowTab, ...)) end
+    function container:AddLabel(Text, DoesWrap) return track(instanceAddLabel(airflowTab, Text, DoesWrap)) end
+    function container:AddDivider() instanceAddDivider(airflowTab); return container end
+    function container:AddBlank() return container end
+    function container:Resize() return container end
 
-    function group:AddMultiSlider(Idx, Info)
-        return group:AddSlider(Idx, Info)
+    function container:AddDependencyBox()
+        local depControls = {}
+        local dep = instanceMakeContainer(airflowTab, nil, depControls)
+
+        function dep:SetupDependencies(dependencies)
+            local function reevaluate()
+                local visible = true
+                for _, dependency in ipairs(dependencies) do
+                    local control, requiredValue = dependency[1], dependency[2]
+                    if control and control.Value ~= requiredValue then
+                        visible = false
+                        break
+                    end
+                end
+                for _, c in ipairs(depControls) do
+                    if c._native and c._native._frame then
+                        pcall(function() c._native._frame.Visible = visible end)
+                    end
+                end
+            end
+
+            for _, dependency in ipairs(dependencies) do
+                local control = dependency[1]
+                if control and control.OnChanged then
+                    control:OnChanged(reevaluate)
+                end
+            end
+            reevaluate()
+        end
+
+        return dep
     end
 
-    function group:AddLeftGroupbox(Name)
-        return group:AddGroupbox and group:AddGroupbox({ Name = Name, Side = 1 }) or group
+    function container:AddGroupbox(Info)
+        Info = Info or {}
+        local box = instanceMakeContainer(airflowTab, Info.Name or Info.Title)
+        container.Groupboxes[Info.Name or Info.Title or tostring(#container.Groupboxes + 1)] = box
+        return box
     end
+    function container:AddLeftGroupbox(Name) return container:AddGroupbox({ Name = Name }) end
+    function container:AddRightGroupbox(Name) return container:AddGroupbox({ Name = Name }) end
 
-    function group:AddRightGroupbox(Name)
-        return group:AddGroupbox and group:AddGroupbox({ Name = Name, Side = 2 }) or group
-    end
-
-    function group:AddTabbox(Info)
-        local tabbox = {
-            Tabs = {},
-            _owner = group,
-        }
+    local function makeTabbox()
+        local tabbox = { Tabs = {} }
         function tabbox:AddTab(Name)
-            local child = { Name = Name }
-            function child:Show()
-                return self
-            end
-            function child:Hide()
-                return self
-            end
-            function child:Resize()
-                return self
-            end
-            tabbox.Tabs[Name] = child
-            return child
+            local sub = instanceMakeContainer(airflowTab, Name)
+            function sub:ShowTab() return sub end
+            function sub:HideTab() return sub end
+            function sub:SetLayoutOrder() return sub end
+            tabbox.Tabs[Name] = sub
+            return sub
         end
         return tabbox
     end
 
-    function group:AddLeftTabbox(Name)
-        return group:AddTabbox({ Name = Name, Side = 1 })
+    function container:AddTabbox(Info)
+        local tabbox = makeTabbox()
+        container.Tabboxes[(Info and (Info.Name or Info.Title)) or tostring(#container.Tabboxes + 1)] = tabbox
+        return tabbox
     end
+    function container:AddLeftTabbox(Name) return container:AddTabbox({ Name = Name }) end
+    function container:AddRightTabbox(Name) return container:AddTabbox({ Name = Name }) end
 
-    function group:AddRightTabbox(Name)
-        return group:AddTabbox({ Name = Name, Side = 2 })
-    end
-
-    return group
+    return container
 end
 
-local function instanceWrapAirflowWindow(window)
-    local proxy = {
-        Tabs = {},
-        Holder = window and (window.Root or window.Body or window.Gui) or nil,
-        _window = window,
-    }
+local function instanceMakeTab(window, name)
+    local airflowTab = window:Tab({ Title = name })
+    local tab = instanceMakeContainer(airflowTab, nil)
+    tab.Name = name
 
-    function proxy:SetWindowTitle(title)
-        if window and type(window.SetTitle) == "function" then
-            window:SetTitle(title)
-        elseif window and window.Title ~= nil then
-            window.Title = title
-        end
-    end
-
-    function proxy:Show()
-        if window and type(window.SetOpen) == "function" then
-            window:SetOpen(true)
-        elseif window and type(window.Toggle) == "function" then
-            window:Toggle(true)
-        end
-        if self.Holder and self.Holder.Parent then
-            self.Holder.Visible = true
-        end
-        return self
-    end
-
-    function proxy:Hide()
-        if window and type(window.SetOpen) == "function" then
-            window:SetOpen(false)
-        elseif window and type(window.Toggle) == "function" then
-            window:Toggle(false)
-        end
-        if self.Holder and self.Holder.Parent then
-            self.Holder.Visible = false
-        end
-        return self
-    end
-
-    function proxy:Toggle(value)
-        if value == nil then
-            if window and type(window.Toggle) == "function" then
-                window:Toggle()
-            elseif window and type(window.SetOpen) == "function" then
-                window:SetOpen(not (window.Open == true))
-            end
-        else
-            if window and type(window.SetOpen) == "function" then
-                window:SetOpen(value)
-            elseif window and type(window.Toggle) == "function" then
-                window:Toggle(value)
-            end
-        end
-        if self.Holder and self.Holder.Parent then
-            self.Holder.Visible = value ~= false
-        end
-        return self
-    end
-
-    function proxy:AddTab(Name)
-        local info = type(Name) == "table" and Name or { Name = Name, Title = Name }
-        local nativeTab = window and window:Tab and window:Tab(info)
-        local tab = {
-            Window = proxy,
-            Groupboxes = {},
-            Tabboxes = {},
-            _native = nativeTab,
-            Name = info.Name or info.Title or Name or "Tab",
-        }
-
-        function tab:ShowTab()
-            if nativeTab and type(nativeTab.Show) == "function" then
-                nativeTab:Show()
-            elseif window and type(window.SelectTab) == "function" then
-                window:SelectTab(nativeTab)
-            end
-            return self
-        end
-
-        function tab:HideTab()
-            if nativeTab and type(nativeTab.Hide) == "function" then
-                nativeTab:Hide()
-            end
-            return self
-        end
-
-        function tab:AddGroupbox(info)
-            local boxInfo = info or { Name = "Group", Side = 1 }
-            local section = nativeTab and nativeTab:Section and nativeTab:Section({
-                Name = boxInfo.Name or boxInfo.Title or "Group",
-                Title = boxInfo.Name or boxInfo.Title or "Group",
-            })
-            local box = instanceWrapAirflowSection(section, self)
-            self.Groupboxes[boxInfo.Name or boxInfo.Title or tostring(#self.Groupboxes + 1)] = box
-            return box
-        end
-
-        function tab:AddLeftGroupbox(Name)
-            return self:AddGroupbox({ Name = Name, Side = 1 })
-        end
-
-        function tab:AddRightGroupbox(Name)
-            return self:AddGroupbox({ Name = Name, Side = 2 })
-        end
-
-        function tab:AddTabbox(Info)
-            local info = Info or {}
-            local tabbox = {
-                Tabs = {},
-                _owner = self,
-            }
-            function tabbox:AddTab(Name)
-                local child = { Name = Name }
-                function child:Show()
-                    return self
-                end
-                function child:Hide()
-                    return self
-                end
-                function child:Resize()
-                    return self
-                end
-                tabbox.Tabs[Name] = child
-                return child
-            end
-            self.Tabboxes[info.Name or Name or tostring(#self.Tabboxes + 1)] = tabbox
-            return tabbox
-        end
-
-        function tab:AddLeftTabbox(Name)
-            return self:AddTabbox({ Name = Name, Side = 1 })
-        end
-
-        function tab:AddRightTabbox(Name)
-            return self:AddTabbox({ Name = Name, Side = 2 })
-        end
-
-        proxy.Tabs[info.Name or info.Title or tostring(#proxy.Tabs + 1)] = tab
+    function tab:ShowTab()
+        pcall(function() window:SelectTab(airflowTab) end)
         return tab
     end
+    function tab:HideTab() return tab end
+    function tab:SetLayoutOrder() return tab end
 
-    return proxy
+    return tab
 end
 
-local function instanceWrapAirflowLibrary(customLibrary, airflow)
-    airflow = airflow or instanceLoadAirflowLibrary()
-    if not customLibrary then
-        customLibrary = loadInstanceLibrary()
-    end
-    if not airflow or not (airflow.Window or airflow.CreateWindow) then
-        return customLibrary
-    end
+-- ---------------------------------------------------------------------------
+-- Library-level shim (replaces the custom blue Library object)
+-- ---------------------------------------------------------------------------
 
-    local adapter = setmetatable({}, {
-        __index = function(_, key)
-            if customLibrary and customLibrary[key] ~= nil then
-                return customLibrary[key]
-            end
-            if airflow and airflow[key] ~= nil then
-                return airflow[key]
-            end
-            return nil
-        end,
-    })
+local function instanceLoadAirflowLibrary()
+    local AirFlow = instanceLoadAirflow()
+    local LibraryShim = { DependencyBoxes = {} }
 
-    adapter.ScreenGui = customLibrary and customLibrary.ScreenGui or nil
-    adapter._custom = customLibrary
-    adapter._airflow = airflow
-    adapter._window = nil
+    function LibraryShim:CreateWindow(config)
+        config = config or {}
 
-    function adapter:CreateWindow(config)
-        local opts = type(config) == "table" and config or { Title = tostring(config or "Airflow"), AutoShow = true }
-        local native = (airflow.Window or airflow.CreateWindow)(opts)
-        local wrapped = instanceWrapAirflowWindow(native)
-        self._window = wrapped
-        return wrapped
-    end
-
-    function adapter:Toggle()
-        if self._window and type(self._window.Toggle) == "function" then
-            self._window:Toggle()
-        elseif self._custom and type(self._custom.Toggle) == "function" then
-            self._custom:Toggle()
-        end
-    end
-
-    function adapter:Notify(...)
-        if self._window and type(self._window.Notify) == "function" then
-            return self._window:Notify(...)
-        end
-        if self._custom and type(self._custom.Notify) == "function" then
-            return self._custom:Notify(...)
-        end
-    end
-
-    return adapter
-end
-
-local CustomLibrary = loadInstanceLibrary()
-local AirflowLibrary = instanceLoadAirflowLibrary()
-local Library = instanceWrapAirflowLibrary(CustomLibrary, AirflowLibrary)
-if Library and Library._airflow and Library._airflow.Window and not Library.CreateWindow then
-    Library.CreateWindow = function(_, config)
-        return Library._airflow.Window(config)
-    end
-end
-
-local function instanceAirflowCompatControl(obj)
-    if not obj or obj._instanceCompatControl then
-        return obj
-    end
-    obj._instanceCompatControl = true
-
-    if type(obj.Set) == "function" and type(obj.SetValue) ~= "function" then
-        obj.SetValue = function(self, value)
-            return self:Set(value)
-        end
-    end
-    if type(obj.SetValue) == "function" and type(obj.SetValues) ~= "function" then
-        obj.SetValues = function(self, values)
-            return self:SetValue(values)
-        end
-    end
-    if type(obj.Set) == "function" and type(obj.Get) ~= "function" then
-        obj.Get = function(self)
-            return self.Value
-        end
-    end
-    if type(obj.Refresh) == "function" and type(obj.Update) ~= "function" then
-        obj.Update = function(self)
-            return self:Refresh()
-        end
-    end
-    if type(obj.Update) == "function" and type(obj.Display) ~= "function" then
-        obj.Display = function(self)
-            return self:Update()
-        end
-    end
-    if type(obj.SetColor) == "function" and type(obj.SetValueRGB) ~= "function" then
-        obj.SetValueRGB = function(self, color, transparency)
-            return self:SetColor(color, transparency)
-        end
-    end
-    if type(obj.SetValueRGB) == "function" and type(obj.SetValue) ~= "function" then
-        obj.SetValue = function(self, value)
-            if type(value) == "Color3" then
-                return self:SetValueRGB(value, 0)
-            end
-            return self:SetValueRGB(value, 0)
-        end
-    end
-    return obj
-end
-
-local function instanceAirflowCompatSection(section)
-    if not section or section._instanceCompatSection then
-        return section
-    end
-    section._instanceCompatSection = true
-
-    local function api(name, createFn)
-        section[name] = function(self, idx, info)
-            local native = createFn(self, idx, info)
-            return instanceAirflowCompatControl(native)
-        end
-    end
-
-    api("AddToggle", function(self, idx, info)
-        local merged = info or {}
-        return self:Toggle({
-            Name = idx or merged.Text or merged.Title or "Toggle",
-            Title = merged.Text or merged.Title or idx or "Toggle",
-            Desc = merged.Tooltip or merged.Desc or merged.Description,
-            Default = merged.Default or false,
-            Callback = merged.Callback or function() end,
-        })
-    end)
-
-    api("AddSlider", function(self, idx, info)
-        local merged = info or {}
-        return self:Slider({
-            Name = idx or merged.Text or merged.Title or "Slider",
-            Title = merged.Text or merged.Title or idx or "Slider",
-            Desc = merged.Tooltip or merged.Desc or merged.Description,
-            Min = merged.Min or 0,
-            Max = merged.Max or 100,
-            Default = merged.Default or merged.Min or 0,
-            Step = merged.Step or (merged.Rounding and 10 ^ (-math.max(0, tonumber(merged.Rounding) or 0)) or 1),
-            Suffix = merged.Suffix or "",
-            Callback = merged.Callback or function() end,
-        })
-    end)
-
-    api("AddInput", function(self, idx, info)
-        local merged = info or {}
-        return self:Input({
-            Name = idx or merged.Text or merged.Title or "Input",
-            Title = merged.Text or merged.Title or idx or "Input",
-            Desc = merged.Tooltip or merged.Desc or merged.Description,
-            PlaceholderText = merged.Placeholder or "",
-            Default = merged.Default or "",
-            Value = merged.Default or "",
-            Callback = merged.Callback or function() end,
-        })
-    end)
-
-    api("AddDropdown", function(self, idx, info)
-        local merged = info or {}
-        return self:Dropdown({
-            Name = idx or merged.Text or merged.Title or "Dropdown",
-            Title = merged.Text or merged.Title or idx or "Dropdown",
-            Desc = merged.Tooltip or merged.Desc or merged.Description,
-            Values = merged.Values or {},
-            Default = merged.Default,
-            Value = merged.Default,
-            Multi = merged.Multi,
-            Callback = merged.Callback or function() end,
-        })
-    end)
-
-    api("AddColorPicker", function(self, idx, info)
-        local merged = info or {}
-        return self:ColorPicker({
-            Name = idx or merged.Text or merged.Title or "Color",
-            Title = merged.Text or merged.Title or idx or "Color",
-            Desc = merged.Tooltip or merged.Desc or merged.Description,
-            Default = merged.Default or Color3.fromRGB(255, 255, 255),
-            Callback = merged.Callback or function() end,
-        })
-    end)
-
-    api("AddKeyPicker", function(self, idx, info)
-        local merged = info or {}
-        return self:Keybind({
-            Name = idx or merged.Text or merged.Title or "Keybind",
-            Title = merged.Text or merged.Title or idx or "Keybind",
-            Desc = merged.Tooltip or merged.Desc or merged.Description,
-            Default = merged.Default or Enum.KeyCode.None,
-            Value = merged.Default or Enum.KeyCode.None,
-            Callback = merged.Callback or function() end,
-        })
-    end)
-
-    api("AddKeybind", function(self, idx, info)
-        return self:AddKeyPicker(idx, info)
-    end)
-
-    api("AddButton", function(self, text, callback)
-        local label = type(text) == "table" and (text.Text or text.Title or text.Name or "Button") or tostring(text or "Button")
-        local fn = type(text) == "table" and (text.Func or text.Callback or callback or function() end) or (callback or function() end)
-        local native = self:Button({
-            Name = label,
-            Title = label,
-            Callback = function(...)
-                if type(fn) == "function" then
-                    local ok, err = pcall(fn, ...)
-                    if not ok and warn then
-                        warn("[Instance] button callback error: " .. tostring(err))
-                    end
-                end
-            end,
-        })
-        native.AddButton = function(_, nextText, nextFn)
-            return self:AddButton(nextText, nextFn)
-        end
-        native.AddTooltip = function(_, _) return native end
-        return native
-    end)
-
-    api("AddLabel", function(self, text)
-        return self:Label({
-            Name = tostring(text or "Label"),
-            Title = tostring(text or "Label"),
-        })
-    end)
-
-    api("AddDivider", function(self)
-        return self:Divider()
-    end)
-
-    section.AddGroupbox = function(self, info)
-        local opts = type(info) == "table" and info or { Name = tostring(info or "Group"), Title = tostring(info or "Group") }
-        local native = self:Section({
-            Name = opts.Name or opts.Title or "Group",
-            Title = opts.Name or opts.Title or "Group",
-        })
-        return instanceAirflowCompatSection(native)
-    end
-    section.AddLeftGroupbox = function(self, name)
-        return self:AddGroupbox({ Name = name, Title = name })
-    end
-    section.AddRightGroupbox = function(self, name)
-        return self:AddGroupbox({ Name = name, Title = name })
-    end
-    section.AddDualSlider = function(self, leftIdx, rightIdx, leftInfo, rightInfo)
-        local left = self:AddSlider(leftIdx, leftInfo)
-        local right = self:AddSlider(rightIdx, rightInfo)
-        return left, right
-    end
-    section.AddMultiSlider = function(self, idx, info)
-        return self:AddSlider(idx, info)
-    end
-    section.AddLeftTabbox = function(self, name)
-        return { Tabs = {}, Name = tostring(name or "Tabbox"), AddTab = function(tabbox, childName)
-            local child = self:Tab({ Name = tostring(childName), Title = tostring(childName) })
-            tabbox.Tabs[tostring(childName)] = instanceAirflowCompatSection(child)
-            return tabbox.Tabs[tostring(childName)]
-        end }
-    end
-    section.AddRightTabbox = function(self, name)
-        return section.AddLeftTabbox(self, name)
-    end
-    section.AddTabbox = function(self, info)
-        local name = type(info) == "table" and (info.Name or info.Title or "Tabbox") or tostring(info or "Tabbox")
-        return section.AddLeftTabbox(self, name)
-    end
-
-    return section
-end
-
-local function instanceAirflowCompatWindow(window)
-    if not window or window._instanceCompatWindow then
-        return window
-    end
-    window._instanceCompatWindow = true
-    window.Holder = window.Root or window.Body or window.Gui or window.Holder
-
-    function window:SetWindowTitle(title)
-        if self.SetTitle and type(self.SetTitle) == "function" then
-            self:SetTitle(title)
-        elseif self.Title ~= nil then
-            self.Title = title
-        end
-    end
-
-    function window:Show()
-        if type(self.SetOpen) == "function" then
-            self:SetOpen(true)
-        elseif type(self.Toggle) == "function" then
-            self:Toggle(true)
-        end
-        if self.Holder and self.Holder.Parent then
-            self.Holder.Visible = true
-        end
-        return self
-    end
-
-    function window:Hide()
-        if type(self.SetOpen) == "function" then
-            self:SetOpen(false)
-        elseif type(self.Toggle) == "function" then
-            self:Toggle(false)
-        end
-        if self.Holder and self.Holder.Parent then
-            self.Holder.Visible = false
-        end
-        return self
-    end
-
-    function window:Toggle(value)
-        if value == nil then
-            if type(self.SetOpen) == "function" then
-                self:SetOpen(not (self.Open == true))
-            elseif type(self.Toggle) == "function" then
-                self:Toggle()
-            end
+        local size = config.Size
+        local udimSize
+        if typeof(size) == "Vector2" then
+            udimSize = UDim2.fromOffset(size.X, size.Y)
+        elseif typeof(size) == "UDim2" then
+            udimSize = size
         else
-            if type(self.SetOpen) == "function" then
-                self:SetOpen(value)
-            elseif type(self.Toggle) == "function" then
-                self:Toggle(value)
-            end
+            udimSize = UDim2.fromOffset(700, 600)
         end
-        if self.Holder and self.Holder.Parent then
-            self.Holder.Visible = value ~= false
+
+        local window = AirFlow.Window({
+            Title = config.Title or "instance",
+            Size = udimSize,
+            ConfigurationSaving = { Enabled = true, FolderName = "instance", FileName = "rivals" },
+        })
+
+        LibraryShim._window = window
+        LibraryShim.ScreenGui = window.Gui
+        LibraryShim.Holder = window.Root
+        LibraryShim.MainColor = AirFlow.Theme.Surface
+        LibraryShim.BackgroundColor = AirFlow.Theme.Background
+        LibraryShim.OutlineColor = AirFlow.Theme.Stroke
+        LibraryShim.FontColor = AirFlow.Theme.Text
+        LibraryShim.AccentColor = AirFlow.Theme.Accent
+        LibraryShim.AccentColorDark = instanceDarkenColor(AirFlow.Theme.Accent, 0.7)
+        LibraryShim.RiskColor = AirFlow.Theme.Error
+        LibraryShim.KeybindFrame = setmetatable({}, { __newindex = function() end, __index = function() return nil end })
+
+        local windowShim = instanceMakeTab -- placeholder to appease linters; real value set below
+        windowShim = { Tabs = {}, Holder = window.Root, _native = window }
+
+        function windowShim:AddTab(name)
+            local tab = instanceMakeTab(window, name)
+            windowShim.Tabs[name] = tab
+            return tab
         end
-        return self
+
+        function windowShim:SetWindowTitle() end
+
+        return windowShim
     end
 
-    function window:AddTab(name)
-        local opts = type(name) == "table" and name or { Name = tostring(name), Title = tostring(name) }
-        local child = self:Tab(opts)
-        return instanceAirflowCompatSection(child)
+    function LibraryShim:Notify(text, time)
+        local win = LibraryShim._window
+        if win then
+            pcall(function() win:Notify({ Content = tostring(text), Duration = time or 4 }) end)
+        end
     end
 
-    if type(window.Notify) == "function" then
-        Library.Notify = function(_, ...) return window:Notify(...) end
+    function LibraryShim:SetWatermark() end
+    function LibraryShim:SetWatermarkVisibility() end
+
+    function LibraryShim:Unload()
+        if LibraryShim._unloadCallbacks then
+            for _, fn in ipairs(LibraryShim._unloadCallbacks) do instanceSafeCall(fn) end
+        end
+        if LibraryShim._window then
+            pcall(function() LibraryShim._window:Destroy() end)
+        end
     end
 
-    return window
+    function LibraryShim:OnUnload(fn)
+        LibraryShim._unloadCallbacks = LibraryShim._unloadCallbacks or {}
+        table.insert(LibraryShim._unloadCallbacks, fn)
+    end
+
+    function LibraryShim:GiveSignal(conn) return conn end
+    function LibraryShim:AttemptSave() end -- Airflow autosaves any control created with Flag= set
+
+    function LibraryShim:GetDarkerColor(color) return instanceDarkenColor(color, 0.7) end
+
+    function LibraryShim:MapValue(value, minA, maxA, minB, maxB)
+        return (1 - ((value - minA) / (maxA - minA))) * minB + ((value - minA) / (maxA - minA)) * maxB
+    end
+
+    function LibraryShim:GetTextBounds(text, font, size, resolution)
+        local ok, bounds = pcall(function()
+            return game:GetService("TextService"):GetTextSize(tostring(text or ""), size or 14, font or Enum.Font.Gotham, resolution or Vector2.new(1000, 1000))
+        end)
+        if ok and bounds then return bounds.X, bounds.Y end
+        return 0, 0
+    end
+
+    function LibraryShim:Create(class, props)
+        props = props or {}
+        local inst
+        if typeof(class) == "Instance" then
+            inst = class
+        else
+            inst = Instance.new(class)
+        end
+        for k, v in pairs(props) do
+            if k ~= "Parent" then pcall(function() inst[k] = v end) end
+        end
+        if props.Parent then inst.Parent = props.Parent end
+        return inst
+    end
+
+    function LibraryShim:CreateLabel(props, isHud)
+        props = props or {}
+        local lbl = Instance.new("TextLabel")
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = props.TextSize or 14
+        lbl.TextColor3 = LibraryShim.FontColor or Color3.new(1, 1, 1)
+        for k, v in pairs(props) do
+            if k ~= "Parent" then pcall(function() lbl[k] = v end) end
+        end
+        if props.Parent then lbl.Parent = props.Parent end
+        return lbl
+    end
+
+    function LibraryShim:AddToRegistry() end
+    function LibraryShim:RemoveFromRegistry() end
+    function LibraryShim:UpdateColorsUsingRegistry() end
+    function LibraryShim:MouseIsOverOpenedFrame() return false end
+    function LibraryShim:IsMouseOverFrame() return false end
+    function LibraryShim:OnHighlight() end
+    function LibraryShim:AddToolTip() end
+    function LibraryShim:MakeDraggable() end
+    function LibraryShim:UpdateDependencyBoxes() end -- handled reactively per-box instead
+
+    function LibraryShim:SafeCallback(fn, ...)
+        instanceSafeCall(fn, ...)
+    end
+
+    return LibraryShim
 end
+
+local Library = instanceLoadAirflowLibrary()
 
 local INSTANCE_ACCENT = Color3.fromRGB(0, 200, 255)
 local INSTANCE_BROWN_ACCENTS = {
