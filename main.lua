@@ -4710,14 +4710,26 @@ local function instanceLoadAirflow()
         return getgenv()[cacheKey]
     end
 
-    local ok, lib = pcall(function()
-        local src = game:HttpGet("https://raw.githubusercontent.com/confessess/AIRFLOW0978109571095710975/main/source.lua")
-        local compiler = loadstring or load
-        return compiler(src)()
+    local fetchOk, src = pcall(function()
+        return game:HttpGet("https://raw.githubusercontent.com/confessess/AIRFLOW0978109571095710975/main/source.lua")
     end)
+    if not fetchOk or type(src) ~= "string" or #src < 100 then
+        error("[instance] Airflow UI download failed: " .. tostring(src))
+    end
 
-    if not ok or type(lib) ~= "table" or type(lib.Window) ~= "function" then
-        error("[instance] Airflow UI failed to load: " .. tostring(lib))
+    local compiler = loadstring or load
+    local chunk, compileErr = compiler(src)
+    if type(chunk) ~= "function" then
+        error("[instance] Airflow UI failed to compile: " .. tostring(compileErr))
+    end
+
+    local runOk, lib = pcall(chunk)
+    if not runOk then
+        error("[instance] Airflow UI errored while initializing: " .. tostring(lib))
+    end
+
+    if type(lib) ~= "table" or type(lib.Window) ~= "function" then
+        error("[instance] Airflow UI returned an unexpected value: " .. tostring(lib))
     end
 
     getgenv()[cacheKey] = lib
@@ -5345,11 +5357,23 @@ local function instanceLoadAirflowLibrary()
             udimSize = UDim2.fromOffset(700, 600)
         end
 
-        local window = AirFlow.Window({
-            Title = config.Title or "instance",
-            Size = udimSize,
-            ConfigurationSaving = { Enabled = true, FolderName = "instance", FileName = "rivals" },
-        })
+        -- NOTE: AirFlow's real Window function is declared `function f.Window(ab, k)` and
+        -- reads its config from the SECOND parameter, so it must be invoked with `:` (colon)
+        -- so the library table itself lands in `ab` and our config lands in `k`. Calling it
+        -- with `.` and one argument silently drops the whole config (caused the earlier
+        -- ":1: attempt to call a nil value" crash — Window ended up with no ConfigurationSaving
+        -- table and other internals never got set up correctly).
+        local ok, window = pcall(function()
+            return AirFlow:Window({
+                Title = config.Title or "instance",
+                Size = udimSize,
+                ConfigurationSaving = { Enabled = true, FolderName = "instance", FileName = "rivals" },
+            })
+        end)
+
+        if not ok or not window then
+            error("[instance] Airflow window creation failed: " .. tostring(window))
+        end
 
         LibraryShim._window = window
         LibraryShim.ScreenGui = window.Gui
